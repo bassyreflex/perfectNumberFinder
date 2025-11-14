@@ -1,0 +1,28 @@
+import socket
+import json
+
+def lucas_lehmer(p):
+    if p == 2:
+        return True
+    M = 2**p - 1
+    s = 4
+    for _ in range(p-2):
+        s = (s*s - 2) % M
+    return s == 0
+
+MASTER_IP = "192.168.137.1"  # master laptop IP
+PORT = 5000
+
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client.connect((MASTER_IP, PORT))
+print("[+] Connected to master")
+
+while True:
+    data = client.recv(1024).decode('utf-8')
+    if not data:
+        break
+    work = json.loads(data.strip())
+    p = work["p"]
+    result = lucas_lehmer(p)
+    send_data = {"id": work["id"], "p": p, "is_mersenne": result}
+    client.sendall(json.dumps(send_data).encode('utf-8') + b"\n")
