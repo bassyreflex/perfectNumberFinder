@@ -10,7 +10,7 @@ def lucas_lehmer(p):
         s = (s*s - 2) % M
     return s == 0
 
-MASTER_IP = "192.168.137.1"  # master laptop IP
+MASTER_IP = "laptop IP"  # master laptop IP
 PORT = 5000
 
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
