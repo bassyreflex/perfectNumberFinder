@@ -1,5 +1,5 @@
 # Dynamic Multiprocessing Client (Windows-safe)
-# Code by Nathan Shaw
+# Author: Nathan Shaw
 
 import socket
 import json
@@ -26,10 +26,10 @@ def lucas_lehmer(p):
 # WORKER PROCESS FUNCTION
 # ---------------------------
 
-def worker_process(worker_id, running_flag, server_ip, port, process_count_proxy):
+def worker_process(worker_id, running_flag, server_ip, port):
     """
     Each worker opens its own socket connection to the server.
-    Reports p, result, CPU usage, worker ID, and number of processes.
+    Reports p, result, CPU usage, worker ID, and optionally number of processes.
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -65,7 +65,6 @@ def worker_process(worker_id, running_flag, server_ip, port, process_count_proxy
                     "is_mersenne": is_mers,
                     "duration": duration,
                     "worker_id": worker_id,
-                    "processes_running": len(process_count_proxy),
                     "cpu": cpu_now
                 }
 
@@ -94,10 +93,11 @@ if __name__ == "__main__":
     MAX_PROCESSES = os.cpu_count() * 2
     MIN_PROCESSES = 1
 
-    # Shared objects (created in main only)
+    # Shared objects
     manager_running = mp.Value('b', True)
-    manager = mp.Manager()
-    process_list = manager.list()
+
+    # Regular list to track processes safely
+    process_list = []
 
     # ---------------------------
     # HELPER FUNCTIONS
@@ -107,7 +107,7 @@ if __name__ == "__main__":
         worker_id = len(process_list)
         p = mp.Process(
             target=worker_process,
-            args=(worker_id, manager_running, MASTER_IP, PORT, process_list),
+            args=(worker_id, manager_running, MASTER_IP, PORT),
             daemon=True
         )
         p.start()
@@ -123,8 +123,7 @@ if __name__ == "__main__":
 
     def cpu_manager():
         """
-        Dynamic scaling manager based on CPU usage.
-        Spawns or removes workers to stay near TARGET_CPU.
+        Dynamically scales worker processes based on CPU usage.
         """
         while manager_running.value:
             cpu = psutil.cpu_percent(interval=1)
@@ -142,10 +141,10 @@ if __name__ == "__main__":
     # START CLIENT
     # ---------------------------
 
-    # start with one worker
+    # Start with one worker
     spawn_worker()
 
-    # start CPU manager in a separate process
+    # Start CPU manager in a separate process
     mgr = mp.Process(target=cpu_manager, daemon=True)
     mgr.start()
 
@@ -156,13 +155,13 @@ if __name__ == "__main__":
         print("[!] Shutting down all workers...")
         manager_running.value = False
 
-        # terminate all worker processes
+        # Terminate all worker processes
         for p in process_list:
             p.terminate()
         for p in process_list:
             p.join()
 
-        # terminate CPU manager
+        # Terminate CPU manager
         mgr.terminate()
         mgr.join()
 
