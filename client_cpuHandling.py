@@ -25,6 +25,21 @@ def lucas_lehmer(p):
 # ---------------------------
 # WORKER PROCESS FUNCTION
 # ---------------------------
+def cpu_manager():
+        """
+        Dynamically scales worker processes based on CPU usage.
+        """
+        while manager_running.value:
+            cpu = psutil.cpu_percent(interval=1)
+            current_count = len(process_list)
+
+            if cpu < TARGET_CPU - 10 and current_count < MAX_PROCESSES:
+                spawn_worker()
+            elif cpu > TARGET_CPU + 10 and current_count > MIN_PROCESSES:
+                remove_worker()
+
+            print(f"[CPU Manager] CPU={cpu:.1f}% Processes={len(process_list)}")
+            time.sleep(1)
 
 def worker_process(worker_id, running_flag, server_ip, port):
     """
@@ -121,21 +136,6 @@ if __name__ == "__main__":
             p.terminate()
             p.join()
 
-    def cpu_manager():
-        """
-        Dynamically scales worker processes based on CPU usage.
-        """
-        while manager_running.value:
-            cpu = psutil.cpu_percent(interval=1)
-            current_count = len(process_list)
-
-            if cpu < TARGET_CPU - 10 and current_count < MAX_PROCESSES:
-                spawn_worker()
-            elif cpu > TARGET_CPU + 10 and current_count > MIN_PROCESSES:
-                remove_worker()
-
-            print(f"[CPU Manager] CPU={cpu:.1f}% Processes={len(process_list)}")
-            time.sleep(1)
 
     # ---------------------------
     # START CLIENT
