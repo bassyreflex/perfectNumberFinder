@@ -25,13 +25,13 @@ def lucas_lehmer(p):
 # ---------------------------
 # WORKER PROCESS FUNCTION
 # ---------------------------
-def cpu_manager(running_flag):
+def cpu_manager(running_flag, processes):
         """
         Dynamically scales worker processes based on CPU usage.
         """
         while running_flag.value:
             cpu = psutil.cpu_percent(interval=1)
-            current_count = len(process_list)
+            current_count = len(processes)
 
             if cpu < TARGET_CPU - 10 and current_count < MAX_PROCESSES:
                 spawn_worker()
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     spawn_worker()
 
     # Start CPU manager in a separate process
-    mgr = mp.Process(target=cpu_manager, args=(manager_running), daemon=True)
+    mgr = mp.Process(target=cpu_manager, args=(manager_running, process_list), daemon=True)
     mgr.start()
 
     try:
