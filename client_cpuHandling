@@ -1,0 +1,116 @@
+import socket
+import json
+import threading
+import psutil
+import queue
+import time
+
+# ---------- Client Settings ----------
+MASTER_IP = "192.168.1.28"
+PORT = 5000
+TARGET_CPU = 60       # target CPU usage %
+CPU_CHECK_INTERVAL = 1 # seconds between CPU checks
+MAX_THREADS = psutil.cpu_count() * 2
+
+# ---------- Work Queue ----------
+work_queue = queue.Queue()
+threads_running = 1
+threads_lock = threading.Lock()
+stop_flag = False
+
+# Each worker will have its own stop event
+worker_stop_events = []
+
+# ---------- Lucas-Lehmer Test ----------
+def lucas_lehmer(p):
+    if p == 2:
+        return True
+    M = 2**p - 1
+    s = 4
+    for _ in range(p-2):
+        s = (s*s - 2) % M
+    return s == 0
+
+# ---------- Worker Function ----------
+def worker(stop_event, client_socket):
+    while not stop_event.is_set():
+        try:
+            work = work_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        p = work["p"]
+        result = lucas_lehmer(p)
+
+        # Send result to server including current threads_running
+        with threads_lock:
+            data_to_send = {
+                "id": work["id"],
+                "p": p,
+                "is_mersenne": result,
+                "threads_running": threads_running
+            }
+
+        try:
+            client_socket.sendall(json.dumps(data_to_send).encode("utf-8") + b"\n")
+        except:
+            break
+
+        work_queue.task_done()
+
+# ---------- CPU Manager ----------
+def cpu_manager(client_socket):
+    global threads_running
+    workers = []
+
+    # Start with 1 worker
+    stop_event = threading.Event()
+    t = threading.Thread(target=worker, args=(stop_event, client_socket), daemon=True)
+    t.start()
+    workers.append(t)
+    worker_stop_events.append(stop_event)
+
+    while not stop_flag:
+        cpu = psutil.cpu_percent(interval=0)  # non-blocking
+        with threads_lock:
+            if cpu < TARGET_CPU and threads_running < MAX_THREADS:
+                # Add a new worker thread
+                stop_event = threading.Event()
+                t = threading.Thread(target=worker, args=(stop_event, client_socket), daemon=True)
+                t.start()
+                workers.append(t)
+                worker_stop_events.append(stop_event)
+                threads_running += 1
+            elif cpu > TARGET_CPU and threads_running > 1:
+                # Remove a worker safely
+                ev = worker_stop_events.pop()
+                ev.set()
+                threads_running -= 1
+        time.sleep(CPU_CHECK_INTERVAL)
+
+# ---------- Main Client Loop ----------
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client.connect((MASTER_IP, PORT))
+print("[+] Connected to master")
+
+# Start CPU manager
+threading.Thread(target=cpu_manager, args=(client,), daemon=True).start()
+
+# Receive work from server
+buffer = ""
+try:
+    while True:
+        data = client.recv(4096).decode("utf-8")
+        if not data:
+            break
+
+        buffer += data
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            if not line.strip():
+                continue
+            work = json.loads(line.strip())
+            work_queue.put(work)
+finally:
+    stop_flag = True
+    client.close()
