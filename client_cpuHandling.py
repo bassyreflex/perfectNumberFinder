@@ -6,7 +6,6 @@ import json
 import multiprocessing as mp
 import psutil
 import time
-import math
 import os
 
 # ---------------------------
@@ -25,26 +24,11 @@ def lucas_lehmer(p):
 # ---------------------------
 # WORKER PROCESS FUNCTION
 # ---------------------------
-def cpu_manager(running_flag, processes):
-        """
-        Dynamically scales worker processes based on CPU usage.
-        """
-        while running_flag.value:
-            cpu = psutil.cpu_percent(interval=1)
-            current_count = len(processes)
-
-            if cpu < TARGET_CPU - 10 and current_count < MAX_PROCESSES:
-                spawn_worker()
-            elif cpu > TARGET_CPU + 10 and current_count > MIN_PROCESSES:
-                remove_worker()
-
-            print(f"[CPU Manager] CPU={cpu:.1f}% Processes={len(process_list)}")
-            time.sleep(1)
 
 def worker_process(worker_id, running_flag, server_ip, port):
     """
     Each worker opens its own socket connection to the server.
-    Reports p, result, CPU usage, worker ID, and optionally number of processes.
+    Reports p, result, CPU usage, and worker ID.
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -93,59 +77,77 @@ def worker_process(worker_id, running_flag, server_ip, port):
     print(f"[-] Worker {worker_id} disconnected")
 
 # ---------------------------
+# CPU MANAGER FUNCTION
+# ---------------------------
+
+def cpu_manager(running_flag, target_cpu, max_processes, min_processes, process_list, server_ip, port):
+    """
+    Dynamically scales worker processes based on CPU usage.
+    """
+    while running_flag.value:
+        cpu = psutil.cpu_percent(interval=1)
+        current_count = len(process_list)
+
+        if cpu < target_cpu - 10 and current_count < max_processes:
+            # Spawn a new worker
+            spawn_worker(process_list, running_flag, server_ip, port)
+        elif cpu > target_cpu + 10 and current_count > min_processes:
+            # Remove one worker
+            remove_worker(process_list)
+
+        print(f"[CPU Manager] CPU={cpu:.1f}% Processes={len(process_list)}")
+        time.sleep(1)
+
+# ---------------------------
+# HELPER FUNCTIONS
+# ---------------------------
+
+def spawn_worker(process_list, running_flag, server_ip, port):
+    worker_id = len(process_list)
+    p = mp.Process(
+        target=worker_process,
+        args=(worker_id, running_flag, server_ip, port),
+        daemon=True  # automatically stops with main process
+    )
+    p.start()
+    process_list.append(p)
+    print(f"[+] Spawned worker {worker_id}")
+
+def remove_worker(process_list):
+    if process_list:
+        p = process_list.pop()
+        p.terminate()
+        p.join()
+        print(f"[-] Removed worker {p.pid}")
+
+# ---------------------------
 # MAIN
 # ---------------------------
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")  # Windows-safe
 
-    # ---------------------------
-    # CONFIG
-    # ---------------------------
     MASTER_IP = "192.168.1.28"  # server IP
     PORT = 5000
     TARGET_CPU = 60
     MAX_PROCESSES = os.cpu_count() * 2
     MIN_PROCESSES = 1
 
-    # Shared objects
+    # Shared value for all workers
     manager_running = mp.Value('b', True)
 
-    # Regular list to track processes safely
+    # Regular list to track worker processes
     process_list = []
 
-    # ---------------------------
-    # HELPER FUNCTIONS
-    # ---------------------------
+    # Start initial worker
+    spawn_worker(process_list, manager_running, MASTER_IP, PORT)
 
-    def spawn_worker():
-        worker_id = len(process_list)
-        p = mp.Process(
-            target=worker_process,
-            args=(worker_id, manager_running, MASTER_IP, PORT),
-            daemon=True
-        )
-        p.start()
-        process_list.append(p)
-        print(f"[+] Spawned worker {worker_id}")
-
-    def remove_worker():
-        if process_list:
-            p = process_list.pop()
-            print(f"[-] Stopping worker process {p.pid}")
-            p.terminate()
-            p.join()
-
-
-    # ---------------------------
-    # START CLIENT
-    # ---------------------------
-
-    # Start with one worker
-    spawn_worker()
-
-    # Start CPU manager in a separate process
-    mgr = mp.Process(target=cpu_manager, args=(manager_running, process_list), daemon=True)
+    # Start CPU manager as a separate process
+    mgr = mp.Process(
+        target=cpu_manager,
+        args=(manager_running, TARGET_CPU, MAX_PROCESSES, MIN_PROCESSES, process_list, MASTER_IP, PORT),
+        daemon=True
+    )
     mgr.start()
 
     try:
@@ -155,14 +157,11 @@ if __name__ == "__main__":
         print("[!] Shutting down all workers...")
         manager_running.value = False
 
-        # Terminate all worker processes
         for p in process_list:
             p.terminate()
         for p in process_list:
             p.join()
 
-        # Terminate CPU manager
         mgr.terminate()
         mgr.join()
-
         print("[!] Client stopped.")
