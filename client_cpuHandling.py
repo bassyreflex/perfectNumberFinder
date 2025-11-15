@@ -1,5 +1,5 @@
-# Dynamic Multiprocessing Client
-# Code written by Nathan Shaw
+# Dynamic Multiprocessing Client (Windows-safe)
+# Code by Nathan Shaw
 
 import socket
 import json
@@ -26,7 +26,11 @@ def lucas_lehmer(p):
 # WORKER PROCESS FUNCTION
 # ---------------------------
 
-def worker_process(worker_id, running_flag, server_ip, port, process_list):
+def worker_process(worker_id, running_flag, server_ip, port, process_count_proxy):
+    """
+    Each worker opens its own socket connection to the server.
+    Reports p, result, CPU usage, worker ID, and number of processes.
+    """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((server_ip, port))
@@ -61,7 +65,7 @@ def worker_process(worker_id, running_flag, server_ip, port, process_list):
                     "is_mersenne": is_mers,
                     "duration": duration,
                     "worker_id": worker_id,
-                    "processes_running": len(process_list),
+                    "processes_running": len(process_count_proxy),
                     "cpu": cpu_now
                 }
 
@@ -79,16 +83,18 @@ def worker_process(worker_id, running_flag, server_ip, port, process_list):
 # ---------------------------
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn")  # Windows-safe
+
     # ---------------------------
     # CONFIG
     # ---------------------------
-    MASTER_IP = "192.168.1.28"  # Master IP
+    MASTER_IP = "192.168.1.28"  # server IP
     PORT = 5000
     TARGET_CPU = 60
     MAX_PROCESSES = os.cpu_count() * 2
     MIN_PROCESSES = 1
 
-    # Shared objects
+    # Shared objects (created in main only)
     manager_running = mp.Value('b', True)
     manager = mp.Manager()
     process_list = manager.list()
@@ -116,7 +122,10 @@ if __name__ == "__main__":
             p.join()
 
     def cpu_manager():
-        """Dynamic scaling manager based on CPU usage."""
+        """
+        Dynamic scaling manager based on CPU usage.
+        Spawns or removes workers to stay near TARGET_CPU.
+        """
         while manager_running.value:
             cpu = psutil.cpu_percent(interval=1)
             current_count = len(process_list)
@@ -130,17 +139,16 @@ if __name__ == "__main__":
             time.sleep(1)
 
     # ---------------------------
-    # START
+    # START CLIENT
     # ---------------------------
 
-    # Start with one worker
+    # start with one worker
     spawn_worker()
 
-    # Start CPU manager process
+    # start CPU manager in a separate process
     mgr = mp.Process(target=cpu_manager, daemon=True)
     mgr.start()
 
-    # Keep main process alive
     try:
         while True:
             time.sleep(1)
@@ -148,13 +156,14 @@ if __name__ == "__main__":
         print("[!] Shutting down all workers...")
         manager_running.value = False
 
-        # Terminate all worker processes
+        # terminate all worker processes
         for p in process_list:
             p.terminate()
         for p in process_list:
             p.join()
 
-        # Stop CPU manager
+        # terminate CPU manager
         mgr.terminate()
         mgr.join()
+
         print("[!] Client stopped.")
