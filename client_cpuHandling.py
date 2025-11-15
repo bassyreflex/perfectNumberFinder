@@ -1,21 +1,29 @@
+# code written by Nathan Shaw
 import socket
 import json
-import threading
-import math
+import multiprocessing as mp
 import psutil
 import time
+import math
+import os
 
-SERVER_IP = "192.168.1.28"
+# ---------------------------
+# CONFIG
+# ---------------------------
+
+MASTER_IP = "192.168.1.28"  # master IP
 PORT = 5000
 
-TARGET_CPU = 60      # target cpu %
-MAX_THREADS = 64     # max threads allowed
-MIN_THREADS = 1      # minimum threads allowed
+TARGET_CPU = 60             # desired CPU usage %
+MAX_PROCESSES = os.cpu_count() * 2  # maximum number of processes
+MIN_PROCESSES = 1           # minimum number of processes
 
-workers = []         # list of worker thread objects
-workers_lock = threading.Lock()
-running = True
+manager_running = mp.Value('b', True)  # global flag to stop everything
+process_list = mp.Manager().list()     # shared list of active processes
 
+# ---------------------------
+# LUCAS-LEHMER FUNCTION
+# ---------------------------
 
 def lucas_lehmer(p):
     if p == 2:
@@ -26,34 +34,32 @@ def lucas_lehmer(p):
         s = (s * s - 2) % M
     return s == 0
 
+# ---------------------------
+# WORKER PROCESS
+# ---------------------------
 
-class WorkerThread(threading.Thread):
-    def __init__(self, wid):
-        super().__init__(daemon=True)
-        self.wid = wid
-        self.running = True
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def worker_process(worker_id, running_flag):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((MASTER_IP, PORT))
+        print(f"[+] Worker {worker_id} connected")
+    except Exception as e:
+        print(f"[!] Worker {worker_id} failed to connect: {e}")
+        return
 
-    def run(self):
+    buffer = ""
+
+    while running_flag.value:
         try:
-            self.sock.connect((SERVER_IP, PORT))
-        except Exception as e:
-            print(f"[Thread {self.wid}] Failed to connect: {e}")
-            return
+            data = sock.recv(4096).decode("utf-8")
+            if not data:
+                break
 
-        buffer = ""
-
-        while self.running:
-            try:
-                data = self.sock.recv(4096).decode("utf-8")
-                if not data:
-                    break
-
-                buffer += data
-                if "\n" not in buffer:
-                    continue
-
+            buffer += data
+            while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
+                if not line.strip():
+                    continue
                 job = json.loads(line.strip())
                 p = job["p"]
 
@@ -67,90 +73,75 @@ class WorkerThread(threading.Thread):
                     "p": p,
                     "is_mersenne": is_mers,
                     "duration": duration,
-                    "thread_id": self.wid,
-                    "threads_running": len(workers),
+                    "worker_id": worker_id,
+                    "processes_running": len(process_list),
                     "cpu": cpu_now
                 }
 
-                self.sock.sendall((json.dumps(result) + "\n").encode())
+                sock.sendall((json.dumps(result) + "\n").encode())
 
-            except:
-                break
+        except Exception as e:
+            print(f"[!] Worker {worker_id} error: {e}")
+            break
 
-        self.sock.close()
+    sock.close()
+    print(f"[-] Worker {worker_id} disconnected")
 
-    def stop(self):
-        self.running = False
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
-            self.sock.close()
-        except:
-            pass
+# ---------------------------
+# PROCESS MANAGEMENT
+# ---------------------------
 
-
-def add_worker():
-    with workers_lock:
-        wid = len(workers)
-        w = WorkerThread(wid)
-        workers.append(w)
-        w.start()
-        print(f"[+] Started worker thread {wid}")
-
+def spawn_worker():
+    worker_id = len(process_list)
+    p = mp.Process(target=worker_process, args=(worker_id, manager_running), daemon=True)
+    p.start()
+    process_list.append(p)
+    print(f"[+] Spawned worker process {worker_id}")
 
 def remove_worker():
-    with workers_lock:
-        if workers:
-            w = workers.pop()
-            print(f"[-] Stopping worker thread {w.wid}")
-            w.stop()
-
+    if process_list:
+        p = process_list.pop()
+        print(f"[-] Stopping worker process {p.pid}")
+        p.terminate()
+        p.join()
 
 def cpu_manager():
-    """Scales thread count to keep CPU near target."""
-    global workers
+    """Dynamic scaling manager based on CPU usage."""
+    while manager_running.value:
+        cpu = psutil.cpu_percent(interval=1)
+        current_count = len(process_list)
 
-    while running:
-        cpu = psutil.cpu_percent(interval=1)  # non-blocking
-        thread_count = len(workers)
-
-        # too low CPU → add worker
-        if cpu < TARGET_CPU - 10 and thread_count < MAX_THREADS:
-            add_worker()
-
-        # too high CPU → remove worker
-        elif cpu > TARGET_CPU + 10 and thread_count > MIN_THREADS:
+        if cpu < TARGET_CPU - 10 and current_count < MAX_PROCESSES:
+            spawn_worker()
+        elif cpu > TARGET_CPU + 10 and current_count > MIN_PROCESSES:
             remove_worker()
 
-        # report status
-        print(f"[CPU Manager] CPU={cpu:.1f}% Threads={thread_count}")
-
+        print(f"[CPU Manager] CPU={cpu:.1f}% Processes={len(process_list)}")
         time.sleep(1)
 
+# ---------------------------
+# MAIN
+# ---------------------------
 
-# -------------------------------------------------------
-# STARTUP
-# -------------------------------------------------------
+if __name__ == "__main__":
+    # start with one worker
+    spawn_worker()
 
-# start with one worker
-add_worker()
+    # start CPU manager
+    mgr = mp.Process(target=cpu_manager, daemon=True)
+    mgr.start()
 
-# start the scaling manager
-mgr = threading.Thread(target=cpu_manager, daemon=True)
-mgr.start()
-
-try:
-    while True:
-        time.sleep(1)
-
-except KeyboardInterrupt:
-    print("Shutting down...")
-
-    running = False
-    with workers_lock:
-        for w in workers:
-            w.stop()
-
-    time.sleep(1)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("[!] Shutting down all workers...")
+        manager_running.value = False
+        # terminate all worker processes
+        for p in process_list:
+            p.terminate()
+        for p in process_list:
+            p.join()
+        mgr.terminate()
+        mgr.join()
+        print("[!] Client stopped.")
