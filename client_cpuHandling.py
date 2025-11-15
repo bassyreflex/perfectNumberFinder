@@ -1,120 +1,156 @@
 import socket
 import json
 import threading
+import math
 import psutil
-import queue
 import time
 
-# ---------- Client Settings ----------
-MASTER_IP = "192.168.1.28"
+SERVER_IP = "192.168.1.28"
 PORT = 5000
-TARGET_CPU = 60       # target CPU usage %
-CPU_CHECK_INTERVAL = 1 # seconds between CPU checks
-MAX_THREADS = psutil.cpu_count() * 2
-print(f"[+] Max threads set to {MAX_THREADS}")
 
-# ---------- Work Queue ----------
-work_queue = queue.Queue()
-threads_running = 1
-threads_lock = threading.Lock()
-stop_flag = False
+TARGET_CPU = 60      # target cpu %
+MAX_THREADS = 64     # max threads allowed
+MIN_THREADS = 1      # minimum threads allowed
 
-# Each worker will have its own stop event
-worker_stop_events = []
+workers = []         # list of worker thread objects
+workers_lock = threading.Lock()
+running = True
 
-# ---------- Lucas-Lehmer Test ----------
+
 def lucas_lehmer(p):
     if p == 2:
         return True
-    M = 2**p - 1
+    M = (1 << p) - 1
     s = 4
-    for _ in range(p-2):
-        s = (s*s - 2) % M
+    for _ in range(p - 2):
+        s = (s * s - 2) % M
     return s == 0
 
-# ---------- Worker Function ----------
-def worker(stop_event, client_socket):
-    while not stop_event.is_set():
+
+class WorkerThread(threading.Thread):
+    def __init__(self, wid):
+        super().__init__(daemon=True)
+        self.wid = wid
+        self.running = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def run(self):
         try:
-            work = work_queue.get(timeout=1)
-        except queue.Empty:
-            continue
+            self.sock.connect((SERVER_IP, PORT))
+        except Exception as e:
+            print(f"[Thread {self.wid}] Failed to connect: {e}")
+            return
 
-        p = work["p"]
-        result = lucas_lehmer(p)
+        buffer = ""
 
-        # Send result to server including current threads_running
-        with threads_lock:
-            data_to_send = {
-                "id": work["id"],
-                "p": p,
-                "is_mersenne": result,
-                "threads_running": threads_running
-            }
+        while self.running:
+            try:
+                data = self.sock.recv(4096).decode("utf-8")
+                if not data:
+                    break
 
+                buffer += data
+                if "\n" not in buffer:
+                    continue
+
+                line, buffer = buffer.split("\n", 1)
+                job = json.loads(line.strip())
+                p = job["p"]
+
+                start = time.time()
+                is_mers = lucas_lehmer(p)
+                duration = time.time() - start
+
+                cpu_now = psutil.cpu_percent(interval=None)
+
+                result = {
+                    "p": p,
+                    "is_mersenne": is_mers,
+                    "duration": duration,
+                    "thread_id": self.wid,
+                    "threads_running": len(workers),
+                    "cpu": cpu_now
+                }
+
+                self.sock.sendall((json.dumps(result) + "\n").encode())
+
+            except:
+                break
+
+        self.sock.close()
+
+    def stop(self):
+        self.running = False
         try:
-            client_socket.sendall(json.dumps(data_to_send).encode("utf-8") + b"\n")
+            self.sock.shutdown(socket.SHUT_RDWR)
         except:
-            break
+            pass
+        try:
+            self.sock.close()
+        except:
+            pass
 
-        work_queue.task_done()
 
-# ---------- CPU Manager ----------
-def cpu_manager(client_socket):
-    global threads_running
-    workers = []
+def add_worker():
+    with workers_lock:
+        wid = len(workers)
+        w = WorkerThread(wid)
+        workers.append(w)
+        w.start()
+        print(f"[+] Started worker thread {wid}")
 
-    # Start with 1 worker
-    stop_event = threading.Event()
-    t = threading.Thread(target=worker, args=(stop_event, client_socket), daemon=True)
-    t.start()
-    workers.append(t)
-    worker_stop_events.append(stop_event)
 
-    while not stop_flag:
-        cpu = psutil.cpu_percent(interval=0)  # non-blocking
-        print(f"[CPU MANAGER] Current CPU usage: {cpu}% with {threads_running} threads")
-        with threads_lock:
-            if cpu < TARGET_CPU and threads_running < MAX_THREADS:
-                # Add a new worker thread
-                print("[+] Spawning additional worker thread")
-                stop_event = threading.Event()
-                t = threading.Thread(target=worker, args=(stop_event, client_socket), daemon=True)
-                t.start()
-                workers.append(t)
-                worker_stop_events.append(stop_event)
-                threads_running += 1
-            elif cpu > TARGET_CPU and threads_running > 1:
-                # Remove a worker safely
-                print("[-] Stopping a worker thread to reduce CPU usage")
-                ev = worker_stop_events.pop()
-                ev.set()
-                threads_running -= 1
-        time.sleep(CPU_CHECK_INTERVAL)
+def remove_worker():
+    with workers_lock:
+        if workers:
+            w = workers.pop()
+            print(f"[-] Stopping worker thread {w.wid}")
+            w.stop()
 
-# ---------- Main Client Loop ----------
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect((MASTER_IP, PORT))
-print("[+] Connected to master")
 
-# Start CPU manager
-threading.Thread(target=cpu_manager, args=(client,), daemon=True).start()
+def cpu_manager():
+    """Scales thread count to keep CPU near target."""
+    global workers
 
-# Receive work from server
-buffer = ""
+    while running:
+        cpu = psutil.cpu_percent(interval=1)  # non-blocking
+        thread_count = len(workers)
+
+        # too low CPU → add worker
+        if cpu < TARGET_CPU - 10 and thread_count < MAX_THREADS:
+            add_worker()
+
+        # too high CPU → remove worker
+        elif cpu > TARGET_CPU + 10 and thread_count > MIN_THREADS:
+            remove_worker()
+
+        # report status
+        print(f"[CPU Manager] CPU={cpu:.1f}% Threads={thread_count}")
+
+        time.sleep(1)
+
+
+# -------------------------------------------------------
+# STARTUP
+# -------------------------------------------------------
+
+# start with one worker
+add_worker()
+
+# start the scaling manager
+mgr = threading.Thread(target=cpu_manager, daemon=True)
+mgr.start()
+
 try:
     while True:
-        data = client.recv(4096).decode("utf-8")
-        if not data:
-            break
+        time.sleep(1)
 
-        buffer += data
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            if not line.strip():
-                continue
-            work = json.loads(line.strip())
-            work_queue.put(work)
-finally:
-    stop_flag = True
-    client.close()
+except KeyboardInterrupt:
+    print("Shutting down...")
+
+    running = False
+    with workers_lock:
+        for w in workers:
+            w.stop()
+
+    time.sleep(1)
