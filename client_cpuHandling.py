@@ -55,7 +55,8 @@ def worker_process(worker_id, running_flag, server_ip, port):
                 is_mers = lucas_lehmer(p)
                 duration = time.time() - start
 
-                cpu_now = psutil.cpu_percent(interval=None)
+                cpu_now = psutil.cpu_percent(interval=0.0)
+                #print(f"{worker_id} measured cpu as {cpu_now}")
 
                 result = {
                     "p": p,
